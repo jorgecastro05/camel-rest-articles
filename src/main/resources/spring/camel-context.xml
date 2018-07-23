@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="
+       http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+       http://camel.apache.org/schema/spring http://camel.apache.org/schema/spring/camel-spring.xsd">
+
+    <bean id="elasticSearchService" class="com.redhat.gpe.training.camel.ElasticSearchService" init-method="init"
+          destroy-method="shutdown"/>
+
+    <!-- Define a traditional camel context here -->
+    <camelContext id="contextCamelRestArticles" xmlns="http://camel.apache.org/schema/spring">
+
+        <dataFormats>
+            <bindy type="Csv" id="csv" classType="com.redhat.gpe.training.camel.Blog"/>
+            <json id="jacksondf" library="Jackson" unmarshalTypeName="com.redhat.gpe.training.camel.Blog"/>
+        </dataFormats>
+
+        <!--on exceptions-->
+        <onException>
+            <exception>org.elasticsearch.client.transport.NoNodeAvailableException</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setBody>
+                <constant>ElasticSearch server is not available, not started, network issue , ...</constant>
+            </setBody>
+            <setHeader headerName="Exchange.CONTENT_TYPE">
+                <constant>text/plain</constant>
+            </setHeader>
+            <setHeader headerName="Exchange.HTTP_RESPONSE_CODE">
+                <constant>400</constant>
+            </setHeader>
+            <log message=">> Exception message : ${exception.message}"/>
+            <log message=">> Stack trace : ${exception.stacktrace}"/>
+        </onException>
+
+        <onException>
+            <exception>org.elasticsearch.index.IndexNotFoundException</exception>
+            <handled>
+                <constant>true</constant>
+            </handled>
+            <setBody>
+                <constant>The [blog] index is missing into the Elasticsearch Database</constant>
+            </setBody>
+            <setHeader headerName="Exchange.CONTENT_TYPE">
+                <constant>text/plain</constant>
+            </setHeader>
+            <setHeader headerName="Exchange.HTTP_RESPONSE_CODE">
+                <constant>400</constant>
+            </setHeader>
+            <log message=">> Exception message : ${exception.message}"/>
+            <log message=">> Stack trace : ${exception.stacktrace}"/>
+        </onException>
+
+        <restConfiguration component="jetty" host="0.0.0.0" port="9191" enableCORS="true" bindingMode="json">
+            <dataFormatProperty key="prettyPrint" value="true"/>
+        </restConfiguration>
+
+        <rest id="rest-blog-service" path="/blog/article/" produces="application/json" consumes="application/json">
+            <get id="rest-searchbyid" uri="search/id/{id}">
+                <to uri="direct:searchById"/>
+            </get>
+            <get id="rest-searchbyuser" uri="search/user/{user}" outType="com.redhat.gpe.training.camel.Blog">
+                <to uri="direct:searchByUser"/>
+            </get>
+            <put id="rest-put-article" type="com.redhat.gpe.training.camel.Blog">
+                <to uri="direct:add"/>
+            </put>
+            <delete id="rest-deletearticle" uri="{id}" type="com.redhat.gpe.training.camel.Blog">
+                <to uri="direct:remove"/>
+            </delete>
+        </rest>
+
+        <rest id="rest-options" path="/blog/article">
+            <verb method="options">
+                <route>
+                    <setHeader headerName="Access-Control-Allow-Origin">
+                        <constant>*</constant>
+                    </setHeader>
+                    <setHeader headerName="Access-Control-Allow-Methods">
+                        <constant>GET, HEAD, POST, PUT, DELETE, OPTIONS</constant>
+                    </setHeader>
+                    <setHeader headerName="Access-Control-Allow-Headers">
+                        <constant>Origin, Accept, X-Requested-With, Content-Type, Access-Control-Request-Method,
+                            Access-Control-Request-Headers
+                        </constant>
+                    </setHeader>
+                    <setHeader headerName="Allow">
+                        <constant>GET, HEAD, POST, PUT, DELETE, OPTIONS</constant>
+                    </setHeader>
+                </route>
+            </verb>
+        </rest>
+
+        <route id="file-marshal-split-service">
+            <from uri="{{fileUri}}"/>
+            <onException>
+                <exception>org.elasticsearch.client.transport.NoNodeAvailableException</exception>
+                <redeliveryPolicy maximumRedeliveries="2"/>
+                <handled>
+                    <constant>true</constant>
+                </handled>
+                <to uri="direct:error"/>
+            </onException>
+            <log message="Records received : ${body}" loggingLevel="DEBUG"/>
+            <unmarshal ref="csv"/>
+            <split>
+                <simple>${body}</simple>
+                <setHeader headerName="id">
+                    <simple>${body.id}</simple>
+                </setHeader>
+                <to uri="direct:add"/>
+            </split>
+        </route>
+
+        <route id="error">
+            <from uri="direct:error"/>
+            <log message="No node Elasticsearch server is available"/>
+        </route>
+
+        <route id="add-direct-route">
+            <from uri="direct:add"/>
+            <log message="Add new Blog entry service called !"/>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_NAME">
+                <simple>{{indexname}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_TYPE">
+                <simple>{{indextype}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_OPERATION">
+                <constant>ElasticsearchConfiguration.OPERATION_INDEX</constant>
+            </setHeader>
+            <setHeader headerName="id">
+                <simple>${body.id}</simple>
+            </setHeader>
+            <marshal ref="jacksondf"/>
+            <bean ref="elasticSearchService" method="add"/>
+            <to uri="elasticsearch://{{clustername}}?ip={{address}}"/>
+            <log message="Response received : ${body}"/>
+        </route>
+
+        <route id="remove-direct-route">
+            <from uri="direct:remove"/>
+            <log message="Remove a Blog entry service called !"/>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_NAME">
+                <simple>{{indexname}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_TYPE">
+                <simple>{{indextype}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_OPERATION">
+                <constant>ElasticsearchConfiguration.OPERATION_GET_BY_ID</constant>
+            </setHeader>
+            <setBody>
+                <simple>${header.id}</simple>
+            </setBody>
+            <to uri="elasticsearch://{{clustername}}?ip={{address}}"/>
+            <bean ref="elasticSearchService" method="getBlog"/>
+            <choice>
+                <when>
+                    <simple>${body} == null</simple>
+                    <setBody>
+                        <simple>No article has been retrieved from the ES DB for this id ${header.id}.</simple>
+                    </setBody>
+                    <setHeader headerName="Exchange.CONTENT_TYPE">
+                        <constant>text/plain</constant>
+                    </setHeader>
+                    <setHeader headerName="Exchange.HTTP_RESPONSE_CODE">
+                        <constant>200</constant>
+                    </setHeader>
+                </when>
+                <otherwise>
+                    <setHeader headerName="ElasticsearchConfiguration.PARAM_OPERATION">
+                        <constant>ElasticsearchConfiguration.OPERATION_DELETE</constant>
+                    </setHeader>
+                    <bean ref="elasticSearchService" method="remove"/>
+                    <to uri="elasticsearch://{{clustername}}?ip={{address}}"/>
+                </otherwise>
+            </choice>
+        </route>
+
+        <route id="searchbyid-direct-route">
+            <from uri="direct:searchById"/>
+            <log message="Search article by ID Service called !"/>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_NAME">
+                <simple>{{indexname}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_TYPE">
+                <simple>{{indextype}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_OPERATION">
+                <constant>ElasticsearchConfiguration.OPERATION_GET_BY_ID</constant>
+            </setHeader>
+            <setBody>
+                <simple>${header.id}</simple>
+            </setBody>
+            <to uri="elasticsearch://{{clustername}}?ip={{address}}"/>
+            <bean ref="elasticSearchService" method="getBlog"/>
+            <choice>
+                <when>
+                    <simple>${body} == null</simple>
+                    <setBody>
+                        <simple>No article has been retrieved from the ES DB for this id ${header.id}.</simple>
+                    </setBody>
+                    <setHeader headerName="Exchange.CONTENT_TYPE">
+                        <constant>text/plain</constant>
+                    </setHeader>
+                    <setHeader headerName="Exchange.HTTP_RESPONSE_CODE">
+                        <constant>200</constant>
+                    </setHeader>
+                </when>
+            </choice>
+        </route>
+
+        <route id="searchbyuser-direct-route">
+            <from uri="direct:searchByUser"/>
+            <log message="Search articles by user Service called !"/>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_NAME">
+                <simple>{{indexname}}</simple>
+            </setHeader>
+            <setHeader headerName="ElasticsearchConfiguration.PARAM_INDEX_TYPE">
+                <simple>{{indextype}}</simple>
+            </setHeader>
+            <bean ref="elasticSearchService" method="getBlogs"/>
+            <choice>
+                <when>
+                    <simple>${body.isEmpty} == 'true'</simple>
+                    <setBody>
+                        <simple>No articles have been retrieved from the ES DB for this user ${header.user}.</simple>
+                    </setBody>
+                    <setHeader headerName="Exchange.CONTENT_TYPE">
+                        <constant>text/plain</constant>
+                    </setHeader>
+                    <setHeader headerName="Exchange.HTTP_RESPONSE_CODE">
+                        <constant>200</constant>
+                    </setHeader>
+                </when>
+            </choice>
+        </route>
+
+    </camelContext>
+
+</beans>
